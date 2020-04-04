@@ -91,6 +91,31 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 
 代码短小精悍，对并发的控制却是精妙绝伦！
 
+## groupcachepb
+
+pb就是protobuf的简写，所以这就是一个提供通信的模块，利用protobuf做序列化和反序列化
+
+里面有groupcache.pb.go和groupcache.proto两个文件，其实就是编写了proto文件然后利用protobuf生成go文件
+
+```go
+message GetRequest {
+  required string group = 1;
+  required string key = 2; // not actually required/guaranteed to be UTF-8
+}
+
+message GetResponse {
+  optional bytes value = 1;
+  optional double minute_qps = 2;
+}
+
+service GroupCache {
+  rpc Get(GetRequest) returns (GetResponse) {
+  };
+}
+```
+
+具体去看proto文件，定义了request和response的一些字段，还定义了rpc通信接口
+
 
 
 
