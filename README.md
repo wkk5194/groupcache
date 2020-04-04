@@ -39,3 +39,58 @@ GroupCache源码阅读的一些笔记 写在这里
 
 源码没有写对key的remove操作，难道要clear掉重新add吗
 
+## singleflight
+
+这个模块实现的功能可以说是groupcache的一大亮点，而且代码量极小
+
+当get请求的key找不到的时候，并发的相同的get请求可能会击穿缓存
+
+通过singleflight对并发相同key的get请求进行拦截，那么真正只会去get一个（无论是去peer还是怎样），其他就可以直接返回
+
+结合代码看一下：
+```go
+type call struct {
+	wg  sync.WaitGroup
+	val interface{}
+	err error
+}
+type Group struct {
+	mu sync.Mutex       
+	m  map[string]*call 
+}
+func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	if c, ok := g.m[key]; ok {
+		g.mu.Unlock()
+		c.wg.Wait()
+		return c.val, c.err
+	}
+	c := new(call)
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	c.val, c.err = fn()
+	c.wg.Done()
+
+	g.mu.Lock()
+	delete(g.m, key)
+	g.mu.Unlock()
+
+	return c.val, c.err
+}
+```
+- 对Group的操作通过mutex锁保护起来
+- 每一个key都有一个call，内部有wg锁来阻塞
+- 当命中key的时候，wg wait，也就是被阻塞住直到执行阻塞的第一次get返回了值
+- 如果没有命中key，那就是第一次get这个key，所以新建一个call，然后wg add 1，然后执行fn函数去取得值，最后wg done释放阻塞
+- 记得用完要把这个key删掉哦 不然下次进来直接命中key而且无阻塞返回val了，导致错误
+
+代码短小精悍，对并发的控制却是精妙绝伦！
+
+
+
+
