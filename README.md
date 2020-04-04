@@ -306,5 +306,43 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 ## groupcache
 
+接下来是控制中心 groupcache.go
+
+抛开一切次要代码 先看一下group结构
+
+```go
+type Group struct {
+	name       string
+	getter     Getter
+	peersOnce  sync.Once
+	peers      PeerPicker
+	cacheBytes int64 
+	mainCache cache
+	hotCache cache
+	loadGroup flightGroup
+	_ int32
+	Stats Stats
+}
+```
+
+源码其实注解得相当清楚：
+- name对应group标识符
+- getter是获取val的处理函数
+- peers是peer groups的集合，实现了peerpicker接口
+- cacheBytes 决定了cache的大小
+- mainCache是当前group的缓存区
+- hotCache是从其他group查询后迁移过来的缓存
+- loadGroup避免缓冲击穿
+- Stats维护了缓存的状态数据，包括查询热点等等
+
+主要逻辑是酱：
+
+- 初始化peers
+- 先在本地的mainCache和hotCache查询，找到就返回
+- 找不到的话去peers中查询，用哪一个peer通过peerPicker，内部由consistenthash实现，然后迁移到hotcache
+- 如果peers还没有，那就去再下一层的数据库或者文件查找（数据源的定义和操作都是自定义的）
+- 中间为了避免缓存击穿，使用了singleflight
+- cache每次操作key后都会根据lru更新
+
 
 
