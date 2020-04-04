@@ -1,74 +1,18 @@
 # groupcache
 
-## Summary
+## Note
 
-groupcache is a distributed caching and cache-filling library, intended as a
-replacement for a pool of memcached nodes in many cases.
+GroupCache源码阅读的一些笔记 写在这里
 
-For API docs and examples, see http://godoc.org/github.com/golang/groupcache
+## lru
 
-## Comparison to memcached
+总体而言实现方式为`双向链表`+`map`
 
-### **Like memcached**, groupcache:
+主要逻辑如下：
 
- * shards by key to select which peer is responsible for that key
+- 添加一个新key/或者更新已有key，将key对应的element执行PushFront/MoveToFront操作，也就是放到链表最前，然后判断是否超过了最大容量，超过就删除链表最末element
+- 查询一个key，同样执行MoveToFront操作
+- 此外当key-element被删除的时候，源码显示可以执行OnEvicted操作，但是似乎在lru cache注册阶段没有写对这个回调函数的注入（???）
 
-### **Unlike memcached**, groupcache:
+缺点的话：主要就是依赖的container/list是线程不安全的，不支持并行，效率有点低，外部需要维护一下同步的问题
 
- * does not require running a separate set of servers, thus massively
-   reducing deployment/configuration pain.  groupcache is a client
-   library as well as a server.  It connects to its own peers, forming
-   a distributed cache.
-
- * comes with a cache filling mechanism.  Whereas memcached just says
-   "Sorry, cache miss", often resulting in a thundering herd of
-   database (or whatever) loads from an unbounded number of clients
-   (which has resulted in several fun outages), groupcache coordinates
-   cache fills such that only one load in one process of an entire
-   replicated set of processes populates the cache, then multiplexes
-   the loaded value to all callers.
-
- * does not support versioned values.  If key "foo" is value "bar",
-   key "foo" must always be "bar".  There are neither cache expiration
-   times, nor explicit cache evictions.  Thus there is also no CAS,
-   nor Increment/Decrement.  This also means that groupcache....
-
- * ... supports automatic mirroring of super-hot items to multiple
-   processes.  This prevents memcached hot spotting where a machine's
-   CPU and/or NIC are overloaded by very popular keys/values.
-
- * is currently only available for Go.  It's very unlikely that I
-   (bradfitz@) will port the code to any other language.
-
-## Loading process
-
-In a nutshell, a groupcache lookup of **Get("foo")** looks like:
-
-(On machine #5 of a set of N machines running the same code)
-
- 1. Is the value of "foo" in local memory because it's super hot?  If so, use it.
-
- 2. Is the value of "foo" in local memory because peer #5 (the current
-    peer) is the owner of it?  If so, use it.
-
- 3. Amongst all the peers in my set of N, am I the owner of the key
-    "foo"?  (e.g. does it consistent hash to 5?)  If so, load it.  If
-    other callers come in, via the same process or via RPC requests
-    from peers, they block waiting for the load to finish and get the
-    same answer.  If not, RPC to the peer that's the owner and get
-    the answer.  If the RPC fails, just load it locally (still with
-    local dup suppression).
-
-## Users
-
-groupcache is in production use by dl.google.com (its original user),
-parts of Blogger, parts of Google Code, parts of Google Fiber, parts
-of Google production monitoring systems, etc.
-
-## Presentations
-
-See http://talks.golang.org/2013/oscon-dl.slide
-
-## Help
-
-Use the golang-nuts mailing list for any discussion or questions.
