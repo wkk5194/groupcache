@@ -124,9 +124,185 @@ byteview模块封装了一个string与byte[] 的统一接口，也就是说用by
 
 这里涉及到的代码重复度比较高，几个struct逻辑都是基本相同的，在此不赘述
 
-## peers
+## peers and http
 
-## http
+这两个模块就完成了peer的分工和协作
+
+先看peer模块，我们这里就不管nopeers的部分了（也没有什么东西），直接看peers
+
+```go
+type ProtoGetter interface {
+	Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error
+}
+type PeerPicker interface {
+	PickPeer(key string) (peer ProtoGetter, ok bool)
+}
+```
+
+定义了两个个接口，关注一下PeerPicker接口，用于在给定key的时候返回处理这个key的peer，类型是protogetter，也就是第一个interface
+
+那么相对应的pickpeer注册如下（可以看到只能注入一次）
+
+```go
+var (
+	portPicker func(groupName string) PeerPicker
+)
+func RegisterPeerPicker(fn func() PeerPicker) {
+	if portPicker != nil {
+		panic("RegisterPeerPicker called more than once")
+	}
+	portPicker = func(_ string) PeerPicker { return fn() }
+}
+```
+
+注册完如何找到key对应peer的函数，在groupcache调用getPeers如下的时候可以查找到peer
+
+```go
+func getPeers(groupName string) PeerPicker {
+	if portPicker == nil {
+		return NoPeers{}
+	}
+	pk := portPicker(groupName)
+	if pk == nil {
+		pk = NoPeers{}
+	}
+	return pk
+}
+```
+
+然后看相对比较复杂的http模块
+
+```go
+type HTTPPool struct {
+	Context func(*http.Request) context.Context
+	Transport func(context.Context) http.RoundTripper
+	// this peer's base URL, e.g. "https://example.net:8000"
+	self string
+	// opts specifies the options.
+	opts HTTPPoolOptions
+
+	mu          sync.Mutex // guards peers and httpGetters
+	peers       *consistenthash.Map
+	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
+}
+type HTTPPoolOptions struct {
+	BasePath string
+	Replicas int
+	HashFn consistenthash.Hash
+}
+```
+
+有上述的options参与定义httppool，所以用到了consistent hash，也就是存放peers hash对应的数据结构，所以会将peers加入到consistent hash中
+
+```go
+type httpGetter struct {
+	transport func(context.Context) http.RoundTripper
+	baseURL   string
+}
+// ... other code
+func (p *HTTPPool) Set(peers ...string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+	p.peers.Add(peers...)
+	p.httpGetters = make(map[string]*httpGetter, len(peers))
+	for _, peer := range peers {
+		p.httpGetters[peer] = &httpGetter{transport: p.Transport, baseURL: peer + p.opts.BasePath}
+	}
+}
+```
+
+我们关注到httpGetter是实际处理通信的，源码这里的transport是一个可自定义的通信函数，默认使用 http.DefaultTransport
+
+那么httpGetter是怎样的呢？其实就是通过protobuf发送get请求
+
+```go
+func (h *httpGetter) Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
+	u := fmt.Sprintf(
+		"%v%v/%v",
+		h.baseURL,
+		url.QueryEscape(in.GetGroup()),
+		url.QueryEscape(in.GetKey()),
+	)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return err
+	}
+	req = req.WithContext(ctx)
+	tr := http.DefaultTransport
+	if h.transport != nil {
+		tr = h.transport(ctx)
+	}
+	res, err := tr.RoundTrip(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned: %v", res.Status)
+	}
+	b := bufferPool.Get().(*bytes.Buffer)
+	b.Reset()
+	defer bufferPool.Put(b)
+	_, err = io.Copy(b, res.Body)
+	if err != nil {
+		return fmt.Errorf("reading response body: %v", err)
+	}
+	err = proto.Unmarshal(b.Bytes(), out)
+	if err != nil {
+		return fmt.Errorf("decoding response body: %v", err)
+	}
+	return nil
+}
+```
+
+那peer作为客户端发送get请求，作为服务端还要响应get请求吧，所以又有如下的handle处理
+
+```go
+func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Parse request.
+	if !strings.HasPrefix(r.URL.Path, p.opts.BasePath) {
+		panic("HTTPPool serving unexpected path: " + r.URL.Path)
+	}
+	parts := strings.SplitN(r.URL.Path[len(p.opts.BasePath):], "/", 2)
+	if len(parts) != 2 {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	groupName := parts[0]
+	key := parts[1]
+
+	// Fetch the value for this group/key.
+	group := GetGroup(groupName)
+	if group == nil {
+		http.Error(w, "no such group: "+groupName, http.StatusNotFound)
+		return
+	}
+	var ctx context.Context
+	if p.Context != nil {
+		ctx = p.Context(r)
+	} else {
+		ctx = r.Context()
+	}
+
+	group.Stats.ServerRequests.Add(1)
+	var value []byte
+	err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Write the value to the response body as a proto message.
+	body, err := proto.Marshal(&pb.GetResponse{Value: value})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-protobuf")
+	w.Write(body)
+}
+```
 
 ## groupcache
 
