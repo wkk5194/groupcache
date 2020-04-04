@@ -116,6 +116,19 @@ service GroupCache {
 
 具体去看proto文件，定义了request和response的一些字段，还定义了rpc通信接口
 
+## byteview and sinks
+
+byteview模块封装了一个string与byte[] 的统一接口，也就是说用byteview提供的接口，可以屏蔽掉string与byte[] 的不同，使用时可以不用考虑是string还是byte[]
+
+然后sinks模块在其基础上实现了几个sinks struct，相当于做了数据的储存，可以set；可以view；setproto方法是用来从protobuf的message中把数据sink下来
+
+这里涉及到的代码重复度比较高，几个struct逻辑都是基本相同的，在此不赘述
+
+## peers
+
+## http
+
+## groupcache
 
 
 
